@@ -1,0 +1,92 @@
+# BUILD.jobs — build one member of a Go monorepo with JOBS (sibling sources).
+#
+# plugins(): declares the "go" build plugin in MONOREPO mode (sibling-sources
+#            design §12.1): passing go_mod alongside go_sum switches the
+#            response to {modules, sources} — sources are the //-rooted
+#            targets of go.mod's relative replace directives.
+# build():   forwards res["sources"] (here ["//lib/common"]) into sources=,
+#            so the sibling lands at $SRC_ROOT/lib/common with the
+#            repo-relative layout intact and `replace … => ../../lib/common`
+#            just works. Everything else is the standard offline, CGO-free
+#            Go build (toolchain via tarball+https, GOPROXY=off).
+
+# Recipe-declared fetchers (JOBS 2026-07-10 design): the plugin build is
+# pinned here; plugin artifacts bundle their companion fetcher pins.
+GOPLUGIN = fetcher(
+    name   = "goplugin",
+    url    = "https://github.com/jobs-build/plugin-go/archive/01b3fef2f92e6a5578f283cc89b03646ca7ded08.tar.gz",
+    sha256 = "64d2a522dcd4e3d407833f2e9189b6904ed6a5fac2a58a32995f5becb7b36005",
+)
+
+def plugins():
+    return {"go": imp(fetcher = GOPLUGIN, params = {})}
+
+def build():
+    # The Go toolchain tarball is named by GOARCH (amd64/arm64); the script
+    # body below is arch-agnostic (GOROOT-relative), so only the toolchain
+    # URL + sha256 are selected per-arch.
+    goarch = {"linux/amd64": "amd64", "linux/arm64": "arm64"}[platform]
+    go_sha = {
+        "amd64": "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+        "arm64": "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768",
+    }
+    toolchain = imp(fetcher = "tarball+https", params = {
+        "url": "https://go.dev/dl/go1.26.4.linux-" + goarch + ".tar.gz",
+        "sha256": go_sha[goarch],
+    })
+
+    # Monorepo mode: go_mod flips the plugin response to {modules, sources}.
+    # This module has ZERO external deps, so there is no go.sum — the plugin
+    # requires the kwarg, so pass "" and modules comes back empty. The module
+    # staging loop below is kept anyway: add a `require` to go.mod + go.sum
+    # and it starts fetching, exactly like the go-build example.
+    res = plugins["go"](go_sum = "", go_mod = source.read("go.mod"))
+
+    inputs = {"toolchain": toolchain}
+    copies = []
+    for m in res["modules"]:
+        name = "mod_" + m["path"].replace("/", "_").replace(".", "_").replace("-", "_")
+        inputs[name] = m["input"]
+        # Each module input's tree is rooted at cache/download/...; stage it in.
+        copies.append('cp -dr "$(jq -r .%s <<<"$JOBS_DEPS")/." "$GOMODCACHE/"' % name)
+
+    # Stage the toolchain (+ module cache) from the read-only /jobs/store into
+    # the writable build tree, then build from local disk (the Go toolchain's
+    # hot path does not love the on-demand FUSE store — see go-build).
+    # CWD is already $SRC = /build/src/services/api; the covered sibling is at
+    # $SRC_ROOT/lib/common, i.e. ../../lib/common — the replace directive
+    # resolves without any recipe-side path surgery. GOWORK=off keeps the
+    # build pinned to this module even though the repo root carries a go.work.
+    script = """
+export GOROOT=/build/goroot
+mkdir -p "$GOROOT" "$out"
+cp -dr "$(jq -r .toolchain <<<"$JOBS_DEPS")/go/." "$GOROOT/"
+export PATH="$GOROOT/bin:$PATH"
+export GOMODCACHE=/build/gomodcache GOCACHE=/go-build-cache GOPATH=/build/gopath
+export GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod GOTOOLCHAIN=local CGO_ENABLED=0 GOWORK=off
+mkdir -p "$GOMODCACHE/cache/download"
+""" + "\n".join(copies) + """
+chmod -R u+w "$GOROOT" "$GOMODCACHE" 2>/dev/null || true
+cd "$SRC"
+go build -o "$out/api" ./...
+cat > "$out/JOBS.entrypoint" <<'EOF'
+{"command": "api", "args": [], "env": {}}
+EOF
+"""
+
+    return struct(
+        name = "example-go-monorepo api",
+        inputs = inputs,
+        env = {},
+        script = script,
+        runtime_deps = [],
+        # The covered closure: the plugin-discovered siblings. Together with
+        # the dir seed (services/api) this is EXACTLY what the build is keyed
+        # on (KP) — edits anywhere else in the repo memo-hit.
+        sources = res["sources"],
+        # Persistent Go build cache (GOCACHE above): rebuilds recompile only
+        # what changed. Keyed to the toolchain release; platform is
+        # auto-appended by the runner. Pruned to what the build accessed
+        # (atime), uploaded on success only.
+        caches = {"/go-build-cache": "example-go-monorepo-go1.26.4"},
+    )
