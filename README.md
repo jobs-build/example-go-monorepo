@@ -1,12 +1,15 @@
 # `example-go-monorepo` — sibling sources in a Go monorepo
 
-A worked example of **sibling sources** (JOBS sibling-sources design,
-2026-07-26): a `BUILD.jobs` in a monorepo subdirectory whose module depends on
-a **sibling directory** through a plain Go `replace` directive — the thing
-that was inexpressible before context widening. `services/api` requires
+A worked example of **sibling sources + source closure** (JOBS
+sibling-sources design 2026-07-26; source-closure design 2026-07-27): a
+`BUILD.jobs` in a monorepo subdirectory whose module depends on a **sibling
+directory** through a plain Go `replace` directive. `services/api` requires
 `example.com/lib/common` via `replace … => ../../lib/common`; the go plugin
-discovers the sibling from `go.mod`, the engine covers it, and the build sees
-it at `$SRC_ROOT/lib/common` with the repo-relative layout intact.
+([`plugin-go` v0.1.0](https://github.com/jobs-build/plugin-go/releases/tag/v0.1.0))
+walks the transitive import closure from `go.mod`, the engine covers exactly
+that, and the build sees the sibling at `$SRC_ROOT/lib/common` with the
+repo-relative layout intact. Requires
+[jobs-iroh ≥ v0.12.0](https://github.com/fables-for-robots/jobs-iroh/releases/tag/v0.12.0).
 
 ## What's here
 
@@ -35,16 +38,19 @@ are the pinned Go toolchain and the pinned plugin build.
    the whole monorepo is the build's context and `dir = services/api`.
 2. **`plugins()`** declares the go plugin (pinned tarball of
    [`jobs-build/plugin-go`](https://github.com/jobs-build/plugin-go)).
-3. **`build()`** calls it in **monorepo mode** — `go_mod =
-   source.read("go.mod")` alongside `go_sum` — and the response switches from
-   the bare module array to `{modules, sources}`: the plugin parses the
-   manifest's relative `replace` targets (Go honors replaces only in the main
-   module, so the consumer's `go.mod` enumerates the whole local sibling
-   closure) and answers `sources = ["//lib/common"]`.
-4. The recipe forwards `res["sources"]` into the `sources =` field of the
-   `build()` return. The engine's covered closure is then `services/api` +
-   the recipe + `lib/common`, and that closure — nothing else — keys the
-   build (KP).
+3. **`build()`** calls it in **closure mode** — `go_mod = source.read("go.mod")`
+   and `go_closure = ["."]` alongside `go_sum` — and the response switches to
+   `{modules, sources, closure}`: the plugin walks the transitive local
+   import graph from the entry package (resolving imports across the
+   manifest's relative `replace` targets — Go honors replaces only in the
+   main module, so the consumer's `go.mod` anchors the whole local sibling
+   closure) and answers `closure = ["//lib/common", "//services/api/…", …]` —
+   the reached sibling package dirs, this module's own files, and the
+   manifests.
+4. The recipe forwards `res["closure"]` into the `closure =` field of the
+   `build()` return: a **complete cover** (source-closure design, jobs-iroh
+   v0.12.0) — no implicit dir seed. Exactly that closure — nothing else —
+   keys the build (KP).
 5. The build sandbox materializes the covered tree at `$SRC_ROOT`
    (`/build/src`) with CWD `$SRC = /build/src/services/api`, so
    `../../lib/common` resolves exactly as it does in the checkout and
@@ -67,8 +73,8 @@ The git-root default widens the context automatically — no flags needed.
 
 ## The memo demo (early cutoff at closure granularity)
 
-The build is keyed by **KP** — the content of the covered closure
-(`services/api` + `lib/common`), not the whole repo:
+The build is keyed by **KP** — the content of the plugin-computed closure
+(this module's files + `lib/common`), not the whole repo:
 
 ```bash
 echo "- meeting notes" >> docs/notes.md
@@ -80,9 +86,9 @@ jobs-client run --source services/api
 #   rebuilds — the sibling IS covered — and prints the new greeting
 ```
 
-Edits outside `lib/common` + `services/api` (docs, CI config, other services)
-re-run only the cheap eval stages and memo-hit the build; edits to either
-covered directory rebuild it. Timestamps don't matter either — the covered
+Edits outside the closure (docs, CI config, `go.work`, other services,
+unimported sibling packages) re-run only the cheap eval stages and memo-hit
+the build; edits to covered paths rebuild it. Timestamps don't matter either — the covered
 tree is normalized before hashing, so `touch` and fresh checkouts of the same
 bytes land on the same KP.
 
