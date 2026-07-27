@@ -1,21 +1,30 @@
-# BUILD.jobs — build one member of a Go monorepo with JOBS (sibling sources).
+# BUILD.jobs — build one member of a Go monorepo with JOBS (source closure).
 #
-# plugins(): declares the "go" build plugin in MONOREPO mode (sibling-sources
-#            design §12.1): passing go_mod alongside go_sum switches the
-#            response to {modules, sources} — sources are the //-rooted
-#            targets of go.mod's relative replace directives.
-# build():   forwards res["sources"] (here ["//lib/common"]) into sources=,
-#            so the sibling lands at $SRC_ROOT/lib/common with the
-#            repo-relative layout intact and `replace … => ../../lib/common`
+# plugins(): declares the "go" build plugin in CLOSURE mode (source-closure
+#            design §8): go_closure=["."] alongside go_mod makes the plugin
+#            walk the transitive local import graph and return the //-rooted
+#            COMPLETE cover in res["closure"] — reached sibling package dirs
+#            (here //lib/common), this module's own files, and the module
+#            manifests.
+# build():   forwards res["closure"] into closure=, so the build is keyed on
+#            EXACTLY its inputs at package-dir granularity: an edit to
+#            anything outside the reached packages — docs/, go.work, an
+#            unimported sibling package — memo-hits. (Files inside a reached
+#            package dir are inputs, stray or not: that is the granularity.)
+#            The sibling still lands at $SRC_ROOT/lib/common with
+#            the repo-relative layout intact, so `replace … => ../../lib/common`
 #            just works. Everything else is the standard offline, CGO-free
 #            Go build (toolchain via tarball+https, GOPROXY=off).
+#
+# Requires jobs-iroh >= v0.12.0 (closure=) and plugin-go >= v0.1.0
+# (go_closure): https://github.com/jobs-build/plugin-go/releases/tag/v0.1.0
 
 # Recipe-declared fetchers (JOBS 2026-07-10 design): the plugin build is
 # pinned here; plugin artifacts bundle their companion fetcher pins.
 GOPLUGIN = fetcher(
     name   = "goplugin",
-    url    = "https://github.com/jobs-build/plugin-go/archive/01b3fef2f92e6a5578f283cc89b03646ca7ded08.tar.gz",
-    sha256 = "64d2a522dcd4e3d407833f2e9189b6904ed6a5fac2a58a32995f5becb7b36005",
+    url    = "https://github.com/jobs-build/plugin-go/archive/refs/tags/v0.1.0.tar.gz",
+    sha256 = "5e578163461a36e4587ec1e312a43a37d7aa466a65e01e381ff75c9cee1b54ef",
 )
 
 def plugins():
@@ -35,12 +44,13 @@ def build():
         "sha256": go_sha[goarch],
     })
 
-    # Monorepo mode: go_mod flips the plugin response to {modules, sources}.
-    # This module has ZERO external deps, so there is no go.sum — the plugin
-    # requires the kwarg, so pass "" and modules comes back empty. The module
-    # staging loop below is kept anyway: add a `require` to go.mod + go.sum
-    # and it starts fetching, exactly like the go-build example.
-    res = plugins["go"](go_sum = "", go_mod = source.read("go.mod"))
+    # Closure mode: go_mod + go_closure flip the plugin response to
+    # {modules, sources, closure}. This module has ZERO external deps, so
+    # there is no go.sum — the plugin requires the kwarg, so pass "" and
+    # modules comes back empty. The module staging loop below is kept anyway:
+    # add a `require` to go.mod + go.sum and it starts fetching, exactly like
+    # the go-build example.
+    res = plugins["go"](go_sum = "", go_mod = source.read("go.mod"), go_closure = ["."])
 
     inputs = {"toolchain": toolchain}
     copies = []
@@ -80,10 +90,12 @@ EOF
         env = {},
         script = script,
         runtime_deps = [],
-        # The covered closure: the plugin-discovered siblings. Together with
-        # the dir seed (services/api) this is EXACTLY what the build is keyed
-        # on (KP) — edits anywhere else in the repo memo-hit.
-        sources = res["sources"],
+        # The COMPLETE cover: the plugin-walked import closure — reached
+        # sibling packages, this module's own files, the manifests. No dir
+        # seed: this is EXACTLY what the build is keyed on (KP) — edits
+        # anywhere else in the repo (docs/, go.work, unimported sibling
+        # packages) memo-hit.
+        closure = res["closure"],
         # Persistent Go build cache (GOCACHE above): rebuilds recompile only
         # what changed. Keyed to the toolchain release; platform is
         # auto-appended by the runner. Pruned to what the build accessed
