@@ -1,5 +1,9 @@
 # `example-go-monorepo` — sibling sources in a Go monorepo
 
+<p align="center">
+  <img src="docs/assets/jobs-logo.jpg" alt="JOBS — Jonas' Own Build System" width="520">
+</p>
+
 A worked example of **sibling sources + source closure** (JOBS
 sibling-sources design 2026-07-26; source-closure design 2026-07-27): a
 `BUILD.jobs` in a monorepo subdirectory whose module depends on a **sibling
